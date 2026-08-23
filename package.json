@@ -1,0 +1,17 @@
+{
+  "name": "tempchat-premium",
+  "version": "1.0.0",
+  "description": "TempChat is a modern temporary real-time chat platform built for portfolio impact. Users create or join a room, chat instantly, and the room data is deleted automatically when everyone leaves.",
+  "main": "index.js",
+  "scripts": {
+  "client": "cd client && npm run dev",
+  "server": "cd server && npm run dev",
+  "dev": "concurrently \"npm run server\" \"npm run client\""
+},
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "concurrently": "^10.0.1"
+  }
+}
