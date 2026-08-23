@@ -269,85 +269,59 @@ if (!normalizedCode || cleanName.length < 2) {
     callback({ ok: true, roomCode: normalizedCode });
   });
 
-  socket.on("room:message", ({ text, file, expiresInMs,replyTo }) => {
+  socket.on("room:message", ({ text, file, replyTo }) => {
     const roomCode = socket.data.roomCode;
-
+  
     const now = Date.now();
-const previousMessage = lastMessageTime.get(socket.id) || 0;
-
-if (now - previousMessage < 500) {
-  return;
-}
-
-lastMessageTime.set(socket.id, now);
-
+    const previousMessage = lastMessageTime.get(socket.id) || 0;
+  
+    if (now - previousMessage < 500) {
+      return;
+    }
+  
+    lastMessageTime.set(socket.id, now);
+  
     if (!roomCode || !roomExists(roomCode)) return;
-
+  
     const cleanText = text?.trim().slice(0, 1000) || "";
+  
     if (!cleanText && !file) return;
-
+  
     const createdAt = Date.now();
-    const allowedExpiries = new Set([10000, 30000, 60000]);
-    const validExpiry = allowedExpiries.has(expiresInMs) ? expiresInMs : null;
-    
-    // Disable burn timers for audio and video explicitly
-    const isPersistentMedia = file && (
-        file.isAudio || 
-        file.data?.startsWith("data:audio/") || 
-        file.data?.startsWith("data:video/")
-    );
-
+  
     const message = {
       id: randomUUID(),
       type: "chat",
       userId: socket.id,
       username: socket.data.username,
       text: cleanText,
-      
+  
       replyTo: replyTo
-? {
-id: replyTo.id,
-username: replyTo.username,
-text: replyTo.text,
-}
-: null,
-file: file
-
         ? {
-            ...file,
-            expiresAt: isPersistentMedia ? null : createdAt + 60000,
+            id: replyTo.id,
+            username: replyTo.username,
+            text: replyTo.text,
           }
         : null,
+  
+      // Files are now persistent for the lifetime of the room.
+      // They will disappear automatically when the room itself expires.
+      file: file
+        ? {
+            ...file,
+            expiresAt: null,
+          }
+        : null,
+  
+      // Individual messages no longer have their own expiry timer.
+      expiresAt: null,
+  
       createdAt,
-      expiresAt: isPersistentMedia ? null : (validExpiry ? createdAt + validExpiry : null),
     };
-
+  
     addMessage(roomCode, message);
+  
     io.to(roomCode).emit("room:message", message);
-
-    if (message.expiresAt) {
-      const timerKey = getTimerKey(roomCode, message.id, "message");
-      const timerId = setTimeout(() => {
-        if (!roomExists(roomCode)) return;
-        removeMessage(roomCode, message.id);
-        io.to(roomCode).emit("room:message-expired", { messageId: message.id });
-        messageTimers.delete(timerKey);
-      }, message.expiresAt - Date.now());
-      messageTimers.set(timerKey, timerId);
-    }
-
-    if (message.file && message.file.expiresAt) {
-      const timerKey = getTimerKey(roomCode, message.id, "file");
-      const timerId = setTimeout(() => {
-        if (!roomExists(roomCode)) return;
-        const didExpire = expireMessageFile(roomCode, message.id);
-        if (didExpire) {
-          io.to(roomCode).emit("room:file-expired", { messageId: message.id });
-        }
-        messageTimers.delete(timerKey);
-      }, message.file.expiresAt - Date.now());
-      messageTimers.set(timerKey, timerId);
-    }
   });
 
   socket.on("room:typing", ({ isTyping }) => {
