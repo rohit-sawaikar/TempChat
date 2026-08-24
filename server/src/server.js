@@ -4,15 +4,14 @@ import http from "http";
 import cors from "cors";
 import { randomUUID } from "node:crypto";
 import { Server } from "socket.io";
+
 import {
   addMessage,
   addUserToRoom,
   createRoom,
-  expireMessageFile,
   getMessages,
   getRoomUsers,
   getTypingUsers,
-  removeMessage,
   removeRoom,
   getRoom,
   addReaction,
@@ -27,6 +26,10 @@ import {
 const app = express();
 const server = http.createServer(app);
 
+/* ─────────────────────────────────────────────────────────────
+   CORS
+───────────────────────────────────────────────────────────── */
+
 const allowedOrigins = process.env.CLIENT_URL
   ? process.env.CLIENT_URL.split(",").map((item) => item.trim())
   : ["http://localhost:5173"];
@@ -36,11 +39,10 @@ const io = new Server(server, {
     origin: allowedOrigins,
     methods: ["GET", "POST"],
   },
-  // ADD THIS: Increase Socket.IO max payload size to 50MB
-  maxHttpBufferSize: 50 * 1024 * 1024
+
+  // Maximum Socket.IO payload: 50 MB
+  maxHttpBufferSize: 50 * 1024 * 1024,
 });
-
-
 
 app.use(
   cors({
@@ -48,23 +50,30 @@ app.use(
   }),
 );
 
-// ADD THIS: Increase Express body parser limits to 50MB
+// Maximum Express payload: 50 MB
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
+/* ─────────────────────────────────────────────────────────────
+   ROOM / TIMER STATE
+───────────────────────────────────────────────────────────── */
 
 const singleUserCountdowns = new Map();
 const adminLeaveCountdowns = new Map();
 const disconnectTimers = new Map();
-const messageTimers = new Map();
-const lastMessageTime = new Map();
 const roomExpiryTimers = new Map();
+
+const lastMessageTime = new Map();
+
 const ROOM_CODE_REGEX = /^[A-Z0-9]{8}$/;
 
-const getTimerKey = (roomCode, messageId, timerType) => `${roomCode}:${messageId}:${timerType}`;
+/* ─────────────────────────────────────────────────────────────
+   ROOM EXPIRY
+───────────────────────────────────────────────────────────── */
 
 const clearRoomExpiryTimer = (roomCode) => {
   const timerId = roomExpiryTimers.get(roomCode);
+
   if (timerId) {
     clearTimeout(timerId);
     roomExpiryTimers.delete(roomCode);
@@ -72,140 +81,276 @@ const clearRoomExpiryTimer = (roomCode) => {
 };
 
 const startRoomExpiryTimer = (roomCode, durationMs) => {
+  clearRoomExpiryTimer(roomCode);
+
   const timerId = setTimeout(() => {
     if (!roomExists(roomCode)) return;
+
     io.to(roomCode).emit("room-expired");
+
     removeRoomCompletely(roomCode);
   }, durationMs);
+
   roomExpiryTimers.set(roomCode, timerId);
 };
 
-const clearRoomTimers = (roomCode) => {
-  for (const timerKey of messageTimers.keys()) {
-    if (!timerKey.startsWith(`${roomCode}:`)) continue;
-    clearTimeout(messageTimers.get(timerKey));
-    messageTimers.delete(timerKey);
-  }
-};
+/* ─────────────────────────────────────────────────────────────
+   SINGLE USER COUNTDOWN
+───────────────────────────────────────────────────────────── */
 
 const clearSingleUserCountdown = (roomCode) => {
   const countdown = singleUserCountdowns.get(roomCode);
+
   if (!countdown) return;
 
   clearInterval(countdown.intervalId);
   clearTimeout(countdown.timeoutId);
+
   singleUserCountdowns.delete(roomCode);
 };
 
-const clearAdminLeaveCountdown = (roomCode) => {
-  const countdown = adminLeaveCountdowns.get(roomCode);
-  if (!countdown) return;
+const startSingleUserCountdown = (roomCode) => {
+  if (!roomExists(roomCode)) return;
 
-  clearInterval(countdown.intervalId);
-  clearTimeout(countdown.timeoutId);
-  adminLeaveCountdowns.delete(roomCode);
-};
+  // Do not start another countdown if one is already running.
+  if (singleUserCountdowns.has(roomCode)) return;
 
-const startAdminLeaveCountdown = (roomCode) => {
+  // Admin countdown has priority.
   if (adminLeaveCountdowns.has(roomCode)) return;
 
   let remainingSeconds = 60;
-  io.to(roomCode).emit("room:admin-countdown", { remainingSeconds });
+
+  io.to(roomCode).emit("room:single-user-countdown", {
+    remainingSeconds,
+  });
 
   const intervalId = setInterval(() => {
-    remainingSeconds -= 1;
-    if (remainingSeconds > 0) {
-      io.to(roomCode).emit("room:admin-countdown", { remainingSeconds });
+    if (!roomExists(roomCode)) {
+      clearSingleUserCountdown(roomCode);
+      return;
     }
-  }, 1000);
 
-  const timeoutId = setTimeout(() => {
-    if (roomExists(roomCode)) {
-      io.to(roomCode).emit("room:closed", {
-        message: "Room deleted after 60 seconds because the Admin left.",
-      });
-      removeRoomCompletely(roomCode);
-    }
-    clearAdminLeaveCountdown(roomCode);
-  }, 60000);
-
-  adminLeaveCountdowns.set(roomCode, { intervalId, timeoutId });
-};
-
-const removeRoomCompletely = (roomCode) => {
-  clearSingleUserCountdown(roomCode);
-  clearAdminLeaveCountdown(roomCode);
-  clearRoomTimers(roomCode);
-  clearRoomExpiryTimer(roomCode);
-  removeRoom(roomCode);
-};
-
-const startSingleUserCountdown = (roomCode) => {
-  if (singleUserCountdowns.has(roomCode)) return;
-
-  let remainingSeconds = 60;
-  io.to(roomCode).emit("room:single-user-countdown", { remainingSeconds });
-
-  const intervalId = setInterval(() => {
-    remainingSeconds -= 1;
-
-    if (remainingSeconds > 0) {
-      io.to(roomCode).emit("room:single-user-countdown", { remainingSeconds });
-    }
-  }, 1000);
-
-  const timeoutId = setTimeout(() => {
     const users = getRoomUsers(roomCode);
+
+    // Someone rejoined.
+    if (users.length > 1) {
+      clearSingleUserCountdown(roomCode);
+
+      io.to(roomCode).emit("room:single-user-countdown", {
+        remainingSeconds: null,
+      });
+
+      return;
+    }
+
+    remainingSeconds -= 1;
+
+    if (remainingSeconds > 0) {
+      io.to(roomCode).emit("room:single-user-countdown", {
+        remainingSeconds,
+      });
+    }
+  }, 1000);
+
+  const timeoutId = setTimeout(() => {
+    if (!roomExists(roomCode)) {
+      clearSingleUserCountdown(roomCode);
+      return;
+    }
+
+    const users = getRoomUsers(roomCode);
+
+    // Delete only if exactly one user remains.
     if (users.length === 1) {
       io.to(roomCode).emit("room:closed", {
-        message: "Room deleted after 60 seconds with only one user remaining.",
+        message:
+          "Room deleted after 60 seconds with only one user remaining.",
       });
+
       removeRoomCompletely(roomCode);
     }
 
     clearSingleUserCountdown(roomCode);
   }, 60000);
 
-  singleUserCountdowns.set(roomCode, { intervalId, timeoutId });
+  singleUserCountdowns.set(roomCode, {
+    intervalId,
+    timeoutId,
+  });
 };
+
+/* ─────────────────────────────────────────────────────────────
+   ADMIN LEAVE COUNTDOWN
+───────────────────────────────────────────────────────────── */
+
+const clearAdminLeaveCountdown = (roomCode) => {
+  const countdown = adminLeaveCountdowns.get(roomCode);
+
+  if (!countdown) return;
+
+  clearInterval(countdown.intervalId);
+  clearTimeout(countdown.timeoutId);
+
+  adminLeaveCountdowns.delete(roomCode);
+};
+
+const startAdminLeaveCountdown = (roomCode) => {
+  if (!roomExists(roomCode)) return;
+
+  // Don't create duplicate admin countdowns.
+  if (adminLeaveCountdowns.has(roomCode)) return;
+
+  // Admin countdown replaces single-user countdown.
+  clearSingleUserCountdown(roomCode);
+
+  let remainingSeconds = 60;
+
+  io.to(roomCode).emit("room:admin-countdown", {
+    remainingSeconds,
+  });
+
+  const intervalId = setInterval(() => {
+    if (!roomExists(roomCode)) {
+      clearAdminLeaveCountdown(roomCode);
+      return;
+    }
+
+    const users = getRoomUsers(roomCode);
+
+    // Nobody remains.
+    if (users.length === 0) {
+      clearAdminLeaveCountdown(roomCode);
+      removeRoomCompletely(roomCode);
+      return;
+    }
+
+    // A user has rejoined.
+    // The room stays alive, but because the admin is still gone,
+    // the admin countdown continues.
+    remainingSeconds -= 1;
+
+    if (remainingSeconds > 0) {
+      io.to(roomCode).emit("room:admin-countdown", {
+        remainingSeconds,
+      });
+    }
+  }, 1000);
+
+  const timeoutId = setTimeout(() => {
+    if (roomExists(roomCode)) {
+      io.to(roomCode).emit("room:closed", {
+        message:
+          "Room deleted after 60 seconds because the Admin left.",
+      });
+
+      removeRoomCompletely(roomCode);
+    }
+
+    clearAdminLeaveCountdown(roomCode);
+  }, 60000);
+
+  adminLeaveCountdowns.set(roomCode, {
+    intervalId,
+    timeoutId,
+  });
+};
+
+/* ─────────────────────────────────────────────────────────────
+   REMOVE ROOM COMPLETELY
+───────────────────────────────────────────────────────────── */
+
+const removeRoomCompletely = (roomCode) => {
+  clearSingleUserCountdown(roomCode);
+  clearAdminLeaveCountdown(roomCode);
+  clearRoomExpiryTimer(roomCode);
+
+  removeRoom(roomCode);
+};
+
+/* ─────────────────────────────────────────────────────────────
+   SYNC ROOM STATE
+───────────────────────────────────────────────────────────── */
 
 const syncRoomState = (roomCode) => {
   if (!roomExists(roomCode)) return;
 
   const users = getRoomUsers(roomCode);
   const room = getRoom(roomCode);
-  
+
+  if (!room) return;
+
   io.to(roomCode).emit("room:users", users);
-  io.to(roomCode).emit("room:typing", getTypingUsers(roomCode));
+
+  io.to(roomCode).emit(
+    "room:typing",
+    getTypingUsers(roomCode),
+  );
+
   io.to(roomCode).emit("room:settings", {
     creatorId: room.creatorId,
-    expiresAt: room.expiresAt
+    expiresAt: room.expiresAt,
   });
 
-  if (users.length <= 1) {
-    if (!adminLeaveCountdowns.has(roomCode)) {
-      startSingleUserCountdown(roomCode);
-    }
+  /*
+   * If the admin has already left, the admin countdown
+   * controls the room lifecycle.
+   */
+  if (adminLeaveCountdowns.has(roomCode)) {
+    clearSingleUserCountdown(roomCode);
+
     return;
   }
 
+  /*
+   * If exactly one user remains, start the
+   * single-user countdown.
+   */
+  if (users.length === 1) {
+    startSingleUserCountdown(roomCode);
+    return;
+  }
+
+  /*
+   * Two or more users means the room is active.
+   */
   clearSingleUserCountdown(roomCode);
-  io.to(roomCode).emit("room:single-user-countdown", { remainingSeconds: null });
+
+  io.to(roomCode).emit("room:single-user-countdown", {
+    remainingSeconds: null,
+  });
 };
 
-
+/* ─────────────────────────────────────────────────────────────
+   HEALTH CHECK
+───────────────────────────────────────────────────────────── */
 
 app.get("/api/health", (_req, res) => {
-  res.status(200).json({ ok: true, name: "TempChat API" });
+  res.status(200).json({
+    ok: true,
+    name: "TempChat API",
+  });
 });
+
+/* ─────────────────────────────────────────────────────────────
+   CREATE ROOM
+───────────────────────────────────────────────────────────── */
 
 app.post("/api/rooms", (_req, res) => {
   const roomCode = createRoom();
-  res.status(201).json({ roomCode });
+
+  res.status(201).json({
+    roomCode,
+  });
 });
 
+/* ─────────────────────────────────────────────────────────────
+   CHECK ROOM
+───────────────────────────────────────────────────────────── */
+
 app.get("/api/rooms/:roomCode", (req, res) => {
-  const roomCode = req.params.roomCode.trim().toUpperCase();
+  const roomCode = req.params.roomCode
+    .trim()
+    .toUpperCase();
 
   if (!ROOM_CODE_REGEX.test(roomCode)) {
     return res.status(400).json({
@@ -213,276 +358,729 @@ app.get("/api/rooms/:roomCode", (req, res) => {
       message: "Invalid room code.",
     });
   }
-  res.status(200).json({ exists: roomExists(roomCode) });
+
+  res.status(200).json({
+    exists: roomExists(roomCode),
+  });
 });
 
+/* ─────────────────────────────────────────────────────────────
+   SOCKET.IO
+───────────────────────────────────────────────────────────── */
+
 io.on("connection", (socket) => {
-  socket.on("room:join", ({ roomCode, username, avatar }, callback) => {
-    const normalizedCode = roomCode?.trim().toUpperCase();
-const cleanName = username?.trim().slice(0, 20);
 
-if (!ROOM_CODE_REGEX.test(normalizedCode)) {
-  callback({
-    ok: false,
-    message: "Invalid room code.",
-  });
-  return;
-}
+  /* ───────────────────────────────────────────────────────────
+     JOIN ROOM
+  ─────────────────────────────────────────────────────────── */
 
-if (!normalizedCode || cleanName.length < 2) {
-      callback({ ok: false, message: "Room code and username are required." });
-      return;
-    }
+  socket.on(
+    "room:join",
+    ({ roomCode, username, avatar }, callback) => {
 
-    if (!roomExists(normalizedCode)) {
-      callback({ ok: false, message: "Room does not exist." });
-      return;
-    }
+      const normalizedCode = roomCode
+        ?.trim()
+        .toUpperCase();
 
-    if (disconnectTimers.has(cleanName)) {
-      clearTimeout(disconnectTimers.get(cleanName));
-      disconnectTimers.delete(cleanName);
-    }
+      const cleanName = username
+        ?.trim()
+        .slice(0, 20);
 
-    socket.join(normalizedCode);
-    socket.data.roomCode = normalizedCode;
-    socket.data.username = cleanName;
-    socket.data.avatar = avatar || { style: "stick", color: "#38bdf8" };
+      if (!normalizedCode || !ROOM_CODE_REGEX.test(normalizedCode)) {
+        callback({
+          ok: false,
+          message: "Invalid room code.",
+        });
 
-    addUserToRoom(normalizedCode, socket.id, cleanName, socket.data.avatar);
-    setTyping(normalizedCode, socket.id, false);
+        return;
+      }
 
-    syncRoomState(normalizedCode);
-    // Serialize reactions (Set → array) before sending history
-    const history = getMessages(normalizedCode).map((m) => ({
-      ...m,
-      reactions: serializeReactions(m.reactions),
-    }));
-    socket.emit("room:messages", history);
-    io.to(normalizedCode).emit("room:system", {
-      id: randomUUID(),
-      type: "system",
-      text: `${cleanName} joined the room`,
-      createdAt: Date.now(),
-    });
+      if (!cleanName || cleanName.length < 2) {
+        callback({
+          ok: false,
+          message: "Room code and username are required.",
+        });
 
-    callback({ ok: true, roomCode: normalizedCode });
-  });
+        return;
+      }
 
-  socket.on("room:message", ({ text, file, replyTo }) => {
-    const roomCode = socket.data.roomCode;
-  
-    const now = Date.now();
-    const previousMessage = lastMessageTime.get(socket.id) || 0;
-  
-    if (now - previousMessage < 500) {
-      return;
-    }
-  
-    lastMessageTime.set(socket.id, now);
-  
-    if (!roomCode || !roomExists(roomCode)) return;
-  
-    const cleanText = text?.trim().slice(0, 1000) || "";
-  
-    if (!cleanText && !file) return;
-  
-    const createdAt = Date.now();
-  
-    const message = {
-      id: randomUUID(),
-      type: "chat",
-      userId: socket.id,
-      username: socket.data.username,
-      text: cleanText,
-  
-      replyTo: replyTo
-        ? {
-            id: replyTo.id,
-            username: replyTo.username,
-            text: replyTo.text,
-          }
-        : null,
-  
-      // Files are now persistent for the lifetime of the room.
-      // They will disappear automatically when the room itself expires.
-      file: file
-        ? {
-            ...file,
-            expiresAt: null,
-          }
-        : null,
-  
-      // Individual messages no longer have their own expiry timer.
-      expiresAt: null,
-  
-      createdAt,
-    };
-  
-    addMessage(roomCode, message);
-  
-    io.to(roomCode).emit("room:message", message);
-  });
+      if (!roomExists(normalizedCode)) {
+        callback({
+          ok: false,
+          message: "Room does not exist.",
+        });
 
-  socket.on("room:typing", ({ isTyping }) => {
-    const roomCode = socket.data.roomCode;
-    if (!roomCode || !roomExists(roomCode)) return;
+        return;
+      }
 
-    setTyping(roomCode, socket.id, Boolean(isTyping));
-    io.to(roomCode).emit("room:typing", getTypingUsers(roomCode));
-  });
+      /*
+       * If this username previously disconnected and
+       * has not yet reached the disconnect timeout,
+       * cancel that pending cleanup.
+       */
+      if (disconnectTimers.has(cleanName)) {
+        clearTimeout(disconnectTimers.get(cleanName));
+        disconnectTimers.delete(cleanName);
+      }
 
-  socket.on("room:set-expiry", ({ durationMs }) => {
-    const roomCode = socket.data.roomCode;
-    if (!roomCode || !roomExists(roomCode)) return;
+      socket.join(normalizedCode);
 
-    const room = getRoom(roomCode);
-    if (room.creatorId !== socket.id) return; // Only creator can set expiry
+      socket.data.roomCode = normalizedCode;
+      socket.data.username = cleanName;
+      socket.data.avatar =
+        avatar || {
+          style: "stick",
+          color: "#38bdf8",
+        };
 
-    const allowedDurations = new Set([0, 5 * 60000, 30 * 60000, 60 * 60000]);
-    if (!allowedDurations.has(durationMs)) return;
+      addUserToRoom(
+        normalizedCode,
+        socket.id,
+        cleanName,
+        socket.data.avatar,
+      );
 
-    if (durationMs === 0) {
-      room.expiresAt = null;
-    } else {
-      room.expiresAt = Date.now() + durationMs;
-    }
+      setTyping(
+        normalizedCode,
+        socket.id,
+        false,
+      );
 
-    clearRoomExpiryTimer(roomCode);
-    if (room.expiresAt !== null) {
-      startRoomExpiryTimer(roomCode, durationMs);
-    }
+      /*
+       * If the admin countdown was active and the
+       * original admin reconnects, cancel it.
+       */
+      const room = getRoom(normalizedCode);
 
-    io.to(roomCode).emit("room:settings", {
-      creatorId: room.creatorId,
-      expiresAt: room.expiresAt
-    });
-  });
+      if (
+        room &&
+        room.creatorId === socket.id
+      ) {
+        clearAdminLeaveCountdown(normalizedCode);
 
-  socket.on("room:privacy-alert", ({ alertType }) => {
-    const roomCode = socket.data.roomCode;
-    const username = socket.data.username;
-    if (!roomCode || !roomExists(roomCode) || !username) return;
+        io.to(normalizedCode).emit(
+          "room:admin-countdown",
+          {
+            remainingSeconds: null,
+          },
+        );
+      }
 
-    if (alertType === "screenshot") {
-      io.to(roomCode).emit("room:system", {
-        id: randomUUID(),
-        type: "system",
-        text: `${username} may have attempted a screenshot`,
-        createdAt: Date.now(),
+      syncRoomState(normalizedCode);
+
+      /*
+       * Send message history.
+       */
+      const history = getMessages(normalizedCode).map(
+        (message) => ({
+          ...message,
+          reactions: serializeReactions(
+            message.reactions,
+          ),
+        }),
+      );
+
+      socket.emit("room:messages", history);
+
+      io.to(normalizedCode).emit(
+        "room:system",
+        {
+          id: randomUUID(),
+          type: "system",
+          text: `${cleanName} joined the room`,
+          createdAt: Date.now(),
+        },
+      );
+
+      callback({
+        ok: true,
+        roomCode: normalizedCode,
       });
-    }
-  });
+    },
+  );
 
-  /* ── Reaction events ───────────────────────────────────────────── */
-  const ALLOWED_EMOJIS = new Set(["👍", "❤️", "😂", "😮", "😢", "🔥"]);
+  /* ───────────────────────────────────────────────────────────
+     SEND MESSAGE
+  ─────────────────────────────────────────────────────────── */
 
-  socket.on("reaction:add", ({ messageId, emoji }) => {
-    const roomCode = socket.data.roomCode;
-    if (!roomCode || !roomExists(roomCode)) return;
-    if (!messageId || !emoji || !ALLOWED_EMOJIS.has(emoji)) return;
+  socket.on(
+    "room:message",
+    ({ text, file, replyTo }) => {
 
-    const reactions = addReaction(roomCode, messageId, socket.data.username, emoji);
-    if (reactions !== null) {
-      io.to(roomCode).emit("reaction:update", { messageId, reactions });
-    }
-  });
+      const roomCode = socket.data.roomCode;
 
-  socket.on("reaction:remove", ({ messageId }) => {
-    const roomCode = socket.data.roomCode;
-    if (!roomCode || !roomExists(roomCode)) return;
-    if (!messageId) return;
+      const now = Date.now();
 
-    const reactions = removeReaction(roomCode, messageId, socket.data.username);
-    if (reactions !== null) {
-      io.to(roomCode).emit("reaction:update", { messageId, reactions });
-    }
-  });
+      const previousMessage =
+        lastMessageTime.get(socket.id) || 0;
 
-  const performActualLeave = (socket, isIntentional, isTimeout = false) => {
-    const roomCode = socket.data.roomCode;
-    const username = socket.data.username;
+      /*
+       * Small anti-spam protection.
+       */
+      if (now - previousMessage < 500) {
+        return;
+      }
+
+      lastMessageTime.set(socket.id, now);
+
+      if (
+        !roomCode ||
+        !roomExists(roomCode)
+      ) {
+        return;
+      }
+
+      const cleanText =
+        text?.trim().slice(0, 1000) || "";
+
+      if (!cleanText && !file) {
+        return;
+      }
+
+      const message = {
+        id: randomUUID(),
+        type: "chat",
+
+        userId: socket.id,
+        username: socket.data.username,
+
+        text: cleanText,
+
+        replyTo: replyTo
+          ? {
+              id: replyTo.id,
+              username: replyTo.username,
+              text: replyTo.text,
+            }
+          : null,
+
+        /*
+         * Files remain available for the lifetime
+         * of the room.
+         */
+        file: file
+          ? {
+              ...file,
+              expiresAt: null,
+            }
+          : null,
+
+        /*
+         * Individual messages no longer expire.
+         */
+        expiresAt: null,
+
+        createdAt: Date.now(),
+      };
+
+      addMessage(roomCode, message);
+
+      io.to(roomCode).emit(
+        "room:message",
+        message,
+      );
+    },
+  );
+
+  /* ───────────────────────────────────────────────────────────
+     TYPING
+  ─────────────────────────────────────────────────────────── */
+
+  socket.on(
+    "room:typing",
+    ({ isTyping }) => {
+
+      const roomCode =
+        socket.data.roomCode;
+
+      if (
+        !roomCode ||
+        !roomExists(roomCode)
+      ) {
+        return;
+      }
+
+      setTyping(
+        roomCode,
+        socket.id,
+        Boolean(isTyping),
+      );
+
+      io.to(roomCode).emit(
+        "room:typing",
+        getTypingUsers(roomCode),
+      );
+    },
+  );
+
+  /* ───────────────────────────────────────────────────────────
+     ROOM EXPIRY SETTING
+  ─────────────────────────────────────────────────────────── */
+
+  socket.on(
+    "room:set-expiry",
+    ({ durationMs }) => {
+
+      const roomCode =
+        socket.data.roomCode;
+
+      if (
+        !roomCode ||
+        !roomExists(roomCode)
+      ) {
+        return;
+      }
+
+      const room = getRoom(roomCode);
+
+      if (!room) return;
+
+      /*
+       * Only room creator/admin can change expiry.
+       */
+      if (room.creatorId !== socket.id) {
+        return;
+      }
+
+      const allowedDurations = new Set([
+        0,
+        5 * 60 * 1000,
+        30 * 60 * 1000,
+        60 * 60 * 1000,
+      ]);
+
+      if (!allowedDurations.has(durationMs)) {
+        return;
+      }
+
+      if (durationMs === 0) {
+        room.expiresAt = null;
+        clearRoomExpiryTimer(roomCode);
+      } else {
+        room.expiresAt =
+          Date.now() + durationMs;
+
+        startRoomExpiryTimer(
+          roomCode,
+          durationMs,
+        );
+      }
+
+      io.to(roomCode).emit(
+        "room:settings",
+        {
+          creatorId: room.creatorId,
+          expiresAt: room.expiresAt,
+        },
+      );
+    },
+  );
+
+  /* ───────────────────────────────────────────────────────────
+     SCREENSHOT / PRIVACY ALERT
+  ─────────────────────────────────────────────────────────── */
+
+  socket.on(
+    "room:privacy-alert",
+    ({ alertType }) => {
+
+      const roomCode =
+        socket.data.roomCode;
+
+      const username =
+        socket.data.username;
+
+      if (
+        !roomCode ||
+        !roomExists(roomCode) ||
+        !username
+      ) {
+        return;
+      }
+
+      if (alertType === "screenshot") {
+        io.to(roomCode).emit(
+          "room:system",
+          {
+            id: randomUUID(),
+            type: "system",
+            text: `${username} may have attempted a screenshot`,
+            createdAt: Date.now(),
+          },
+        );
+      }
+    },
+  );
+
+  /* ───────────────────────────────────────────────────────────
+     REACTIONS
+  ─────────────────────────────────────────────────────────── */
+
+  const ALLOWED_EMOJIS = new Set([
+    "👍",
+    "❤️",
+    "😂",
+    "😮",
+    "😢",
+    "🔥",
+  ]);
+
+  socket.on(
+    "reaction:add",
+    ({ messageId, emoji }) => {
+
+      const roomCode =
+        socket.data.roomCode;
+
+      if (
+        !roomCode ||
+        !roomExists(roomCode)
+      ) {
+        return;
+      }
+
+      if (
+        !messageId ||
+        !emoji ||
+        !ALLOWED_EMOJIS.has(emoji)
+      ) {
+        return;
+      }
+
+      const reactions = addReaction(
+        roomCode,
+        messageId,
+        socket.data.username,
+        emoji,
+      );
+
+      if (reactions !== null) {
+        io.to(roomCode).emit(
+          "reaction:update",
+          {
+            messageId,
+            reactions,
+          },
+        );
+      }
+    },
+  );
+
+  socket.on(
+    "reaction:remove",
+    ({ messageId }) => {
+
+      const roomCode =
+        socket.data.roomCode;
+
+      if (
+        !roomCode ||
+        !roomExists(roomCode)
+      ) {
+        return;
+      }
+
+      if (!messageId) return;
+
+      const reactions = removeReaction(
+        roomCode,
+        messageId,
+        socket.data.username,
+      );
+
+      if (reactions !== null) {
+        io.to(roomCode).emit(
+          "reaction:update",
+          {
+            messageId,
+            reactions,
+          },
+        );
+      }
+    },
+  );
+
+  /* ───────────────────────────────────────────────────────────
+     ACTUAL LEAVE
+  ─────────────────────────────────────────────────────────── */
+
+  const performActualLeave = (
+    socket,
+    isIntentional,
+    isTimeout = false,
+  ) => {
+
+    const roomCode =
+      socket.data.roomCode;
+
+    const username =
+      socket.data.username;
+
     const socketId = socket.id;
+
     lastMessageTime.delete(socketId);
 
-    if (!roomCode || !roomExists(roomCode)) return;
-
-    const room = getRoom(roomCode);
-    if (!room) return;
-    
-    // Check if the user is the Admin BEFORE removing them
-    const isAdmin = room.creatorId === socketId;
-
-    if (isIntentional) {
-      clearUserData(roomCode, username);
-      
-      const history = getMessages(roomCode).map((m) => ({
-        ...m,
-        reactions: serializeReactions(m.reactions),
-      }));
-      io.to(roomCode).emit("room:messages", history);
+    if (
+      !roomCode ||
+      !roomExists(roomCode)
+    ) {
+      return;
     }
 
-    // Always remove from room
-    removeUserFromRoom(roomCode, socketId);
-    setTyping(roomCode, socketId, false);
+    const room = getRoom(roomCode);
 
-    const usersLeft = getRoomUsers(roomCode);
+    if (!room) return;
 
+    /*
+     * Determine whether this socket is the admin
+     * BEFORE removing it.
+     */
+    const isAdmin =
+      room.creatorId === socketId;
+
+    /*
+     * Clear user's temporary data when intentionally
+     * leaving.
+     */
+    if (isIntentional) {
+      clearUserData(
+        roomCode,
+        username,
+      );
+
+      const history = getMessages(
+        roomCode,
+      ).map((message) => ({
+        ...message,
+        reactions:
+          serializeReactions(
+            message.reactions,
+          ),
+      }));
+
+      io.to(roomCode).emit(
+        "room:messages",
+        history,
+      );
+    }
+
+    /*
+     * Remove user from the room.
+     */
+    removeUserFromRoom(
+      roomCode,
+      socketId,
+    );
+
+    setTyping(
+      roomCode,
+      socketId,
+      false,
+    );
+
+    const usersLeft =
+      getRoomUsers(roomCode);
+
+    /*
+     * Nobody is left.
+     * Delete room immediately.
+     */
     if (usersLeft.length === 0) {
       removeRoomCompletely(roomCode);
       return;
     }
 
-    syncRoomState(roomCode);
-
+    /*
+     * ADMIN LEFT
+     *
+     * Admin leaving gets its own dedicated
+     * 60-second countdown.
+     */
     if (isIntentional && isAdmin) {
-      io.to(roomCode).emit("room:system", {
-        id: randomUUID(),
-        type: "system",
-        text: `Admin ${username} left the room. Room will be destroyed in 60 seconds.`,
-        createdAt: Date.now(),
-      });
-      startAdminLeaveCountdown(roomCode);
-    } else if (!isTimeout || isIntentional) {
-      io.to(roomCode).emit("room:system", {
-        id: randomUUID(),
-        type: "system",
-        text: `${username} left the room`,
-        createdAt: Date.now(),
-      });
+
+      /*
+       * Cancel any single-user countdown.
+       */
+      clearSingleUserCountdown(
+        roomCode,
+      );
+
+      io.to(roomCode).emit(
+        "room:single-user-countdown",
+        {
+          remainingSeconds: null,
+        },
+      );
+
+      io.to(roomCode).emit(
+        "room:system",
+        {
+          id: randomUUID(),
+          type: "system",
+          text:
+            `Admin ${username} left the room. ` +
+            `Room will be destroyed in 60 seconds.`,
+          createdAt: Date.now(),
+        },
+      );
+
+      startAdminLeaveCountdown(
+        roomCode,
+      );
+
+      /*
+       * Update online users/settings WITHOUT
+       * starting another single-user countdown.
+       */
+      const updatedRoom = getRoom(roomCode);
+
+      if (updatedRoom) {
+        io.to(roomCode).emit(
+          "room:users",
+          usersLeft,
+        );
+
+        io.to(roomCode).emit(
+          "room:typing",
+          getTypingUsers(roomCode),
+        );
+
+        io.to(roomCode).emit(
+          "room:settings",
+          {
+            creatorId:
+              updatedRoom.creatorId,
+            expiresAt:
+              updatedRoom.expiresAt,
+          },
+        );
+      }
+
+      return;
     }
+
+    /*
+     * NORMAL USER LEFT
+     */
+    if (!isTimeout || isIntentional) {
+      io.to(roomCode).emit(
+        "room:system",
+        {
+          id: randomUUID(),
+          type: "system",
+          text: `${username} left the room`,
+          createdAt: Date.now(),
+        },
+      );
+    }
+
+    /*
+     * Synchronize room state.
+     *
+     * If one user remains, this starts the
+     * 60-second single-user countdown.
+     */
+    syncRoomState(roomCode);
   };
 
+  /* ───────────────────────────────────────────────────────────
+     INTENTIONAL LEAVE
+  ─────────────────────────────────────────────────────────── */
+
   socket.on("room:leave", () => {
-    const username = socket.data.username;
-    if (disconnectTimers.has(username)) {
-      clearTimeout(disconnectTimers.get(username));
+
+    const username =
+      socket.data.username;
+
+    if (
+      username &&
+      disconnectTimers.has(username)
+    ) {
+      clearTimeout(
+        disconnectTimers.get(username),
+      );
+
       disconnectTimers.delete(username);
     }
-    
-    performActualLeave(socket, true);
-    socket.leave(socket.data.roomCode);
+
+    performActualLeave(
+      socket,
+      true,
+      false,
+    );
+
+    const roomCode =
+      socket.data.roomCode;
+
+    if (roomCode) {
+      socket.leave(roomCode);
+    }
+
     socket.data.roomCode = undefined;
     socket.data.username = undefined;
+    socket.data.avatar = undefined;
   });
 
-  socket.on("disconnect", () => {
-    const roomCode = socket.data.roomCode;
-    const username = socket.data.username;
-    
-    if (!roomCode || !username) return;
+  /* ───────────────────────────────────────────────────────────
+     DISCONNECT
+  ─────────────────────────────────────────────────────────── */
 
+  socket.on("disconnect", () => {
+
+    const roomCode =
+      socket.data.roomCode;
+
+    const username =
+      socket.data.username;
+
+    if (!roomCode || !username) {
+      return;
+    }
+
+    /*
+     * Give temporary network disconnects 30 seconds
+     * to reconnect before treating them as a leave.
+     */
     const timer = setTimeout(() => {
-      // Treat as intentional leave after 30s timeout per requirement
-      performActualLeave(socket, true, true);
+
+      /*
+       * Socket may have reconnected or already
+       * been cleaned up.
+       */
+      if (
+        !socket.data.roomCode ||
+        !socket.data.username
+      ) {
+        disconnectTimers.delete(username);
+        return;
+      }
+
+      performActualLeave(
+        socket,
+        true,
+        true,
+      );
+
       disconnectTimers.delete(username);
+
     }, 30000);
-    disconnectTimers.set(username, timer);
+
+    disconnectTimers.set(
+      username,
+      timer,
+    );
   });
 });
 
-const PORT = Number(process.env.PORT) || 4000;
+/* ─────────────────────────────────────────────────────────────
+   START SERVER
+───────────────────────────────────────────────────────────── */
+
+const PORT =
+  Number(process.env.PORT) || 4000;
+
 server.listen(PORT, () => {
-  console.log(`TempChat server listening on port ${PORT}`);
+  console.log(
+    `TempChat server listening on port ${PORT}`,
+  );
 });

@@ -432,7 +432,10 @@ useEffect(() => {
     } catch { showToast('Could not copy link.', 'error') }
   }
 
-  const leaveRoom = () => { socket.emit('room:leave'); socket.disconnect(); navigate('/room') }
+  const leaveRoom = () => {
+    socket.emit('room:leave')
+    navigate('/room')
+  }
 
   const panicExit = () => {
     socket.emit('room:leave'); socket.disconnect()
