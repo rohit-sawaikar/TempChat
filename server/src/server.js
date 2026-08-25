@@ -987,11 +987,11 @@ io.on("connection", (socket) => {
      INTENTIONAL LEAVE
   ─────────────────────────────────────────────────────────── */
 
-  socket.on("room:leave", () => {
+  socket.on("room:leave", (callback) => {
 
     const username =
       socket.data.username;
-
+  
     if (
       username &&
       disconnectTimers.has(username)
@@ -999,26 +999,43 @@ io.on("connection", (socket) => {
       clearTimeout(
         disconnectTimers.get(username),
       );
-
+  
       disconnectTimers.delete(username);
     }
-
+  
+    const roomCode =
+      socket.data.roomCode;
+  
+    /*
+     * Process the intentional leave FIRST.
+     * This removes the user, clears their messages,
+     * sends the leave notification, and starts the
+     * single-user countdown if necessary.
+     */
     performActualLeave(
       socket,
       true,
       false,
     );
-
-    const roomCode =
-      socket.data.roomCode;
-
+  
+    /*
+     * Leave the Socket.IO room only AFTER the server
+     * has processed the user's departure.
+     */
     if (roomCode) {
       socket.leave(roomCode);
     }
-
+  
     socket.data.roomCode = undefined;
     socket.data.username = undefined;
     socket.data.avatar = undefined;
+  
+    /*
+     * Confirm to the client that the leave was processed.
+     */
+    if (typeof callback === "function") {
+      callback({ ok: true });
+    }
   });
 
   /* ───────────────────────────────────────────────────────────

@@ -50,6 +50,7 @@ function ChatRoomPage() {
   const [roomExpiryMode, setRoomExpiryMode] = useState(0)
   const [countdown, setCountdown] = useState(null)
   const [adminCountdown, setAdminCountdown] = useState(null)
+  
 
   
   /* ── Voice Recording State ──────────────────────────────────────────────────── */
@@ -70,6 +71,7 @@ function ChatRoomPage() {
   const messageInputRef = useRef(null)
   const typingTimeoutRef   = useRef(null)
   const toastTimeoutsRef   = useRef([])
+  const leavingRoomRef = useRef(false);
 
   /* ── Toasts notification ──────────────────────────────────────────────────── */
   const showToast = useCallback((message, type = 'info') => {
@@ -139,7 +141,12 @@ function ChatRoomPage() {
         mediaRecorderRef.current.stop()
         clearInterval(recordingIntervalRef.current)
       }
-      socket.emit('room:leave'); socket.removeAllListeners(); socket.disconnect()
+      if (!leavingRoomRef.current) {
+        socket.emit("room:leave");
+      }
+      
+      socket.removeAllListeners();
+      socket.disconnect();
       if (audioCtxRef.current) audioCtxRef.current.close()
       if (animationRef.current) cancelAnimationFrame(animationRef.current)
     }
@@ -433,14 +440,33 @@ useEffect(() => {
   }
 
   const leaveRoom = () => {
-    socket.emit('room:leave')
-    navigate('/room')
-  }
+    if (leavingRoomRef.current) return;
+  
+    leavingRoomRef.current = true;
+  
+    socket.emit("room:leave", (response) => {
+      if (response?.ok) {
+        navigate("/room");
+      }
+    });
+  };
 
   const panicExit = () => {
-    socket.emit('room:leave'); socket.disconnect()
-    localStorage.clear(); sessionStorage.clear(); navigate('/')
-  }
+    if (leavingRoomRef.current) return;
+  
+    leavingRoomRef.current = true;
+  
+    socket.emit("room:leave", (response) => {
+      if (response?.ok) {
+        socket.disconnect();
+  
+        localStorage.clear();
+        sessionStorage.clear();
+  
+        navigate("/");
+      }
+    });
+  };
 
  
 
