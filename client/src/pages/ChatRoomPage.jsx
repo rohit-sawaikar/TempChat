@@ -282,6 +282,35 @@ useEffect(() => {
       showToast(`File selected: ${file.name}`)
     }
 
+  /* ── Clipboard Image Paste ────────────────────────────────────────────────── */
+  const handlePaste = e => {
+    if (isUploading) return
+    const items = e.clipboardData?.items
+    if (!items) return
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.type.startsWith('image/')) {
+        e.preventDefault()
+        try {
+          const blob = item.getAsFile()
+          if (!blob) break
+
+          const ext = blob.type.split('/')[1] || 'png'
+          const filename = `pasted-image-${Date.now()}.${ext}`
+          const file = new File([blob], filename, { type: blob.type })
+
+          handleDroppedFile(file)
+        } catch {
+          showToast('Failed to paste image.', 'error')
+        }
+        break
+      }
+    }
+  }
+
+  /* ── Send Messages ────────────────────────────────────────────────────── */
+
 
 
 
@@ -931,21 +960,22 @@ useEffect(() => {
                 </div>
 
                 <input
-  ref={messageInputRef}
-  value={messageInput}
-  disabled={isUploading}
-  onChange={handleInputChange}
-  onKeyDown={e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
-  }}
-  maxLength={1000}
-  placeholder="Write a message…"
-  className="input-field flex-1"
-  style={{ borderRadius: '14px' }}
-/>
+                  ref={messageInputRef}
+                  value={messageInput}
+                  disabled={isUploading}
+                  onChange={handleInputChange}
+                  onPaste={handlePaste}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault()
+                      handleSend()
+                    }
+                  }}
+                  maxLength={1000}
+                  placeholder="Write a message…"
+                  className="input-field flex-1"
+                  style={{ borderRadius: '14px' }}
+                />
 
                 {/* Attach */}
                 <label
