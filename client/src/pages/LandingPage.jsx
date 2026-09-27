@@ -85,14 +85,15 @@ function LandingPage() {
           <MessageSquareText size={16} />
           Start Chatting
         </Link>
-        <button
-  type="button"
-  onClick={() => window.open('/how-it-works', '_blank')}
-  className="btn btn-ghost text-sm px-7 py-3 font-semibold"
-  style={{ fontSize: '14px' }}
->
-  See how it works
-</button>
+        <Link
+          to="/how-it-works"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="btn btn-ghost text-sm px-7 py-3 font-semibold"
+          style={{ fontSize: '14px' }}
+        >
+          See how it works
+        </Link>
       </div>
 
       {/* Feature cards */}

@@ -12,8 +12,8 @@ function App() {
       <Route path="/room" element={<RoomAccessPage />} />
       <Route path="/chat/:roomCode" element={<ChatRoomPage />} />
       <Route path="/home" element={<Navigate to="/" replace />} />
-      <Route path="*" element={<NotFoundPage />} />
       <Route path="/how-it-works" element={<HowItWorksPage />} />
+      <Route path="*" element={<NotFoundPage />} />
     </Routes>
   )
 }
