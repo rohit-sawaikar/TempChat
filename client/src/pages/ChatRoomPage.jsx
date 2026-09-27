@@ -5,6 +5,7 @@ import ChatMessage from '../components/ChatMessage'
 import OnlineUsers from '../components/OnlineUsers'
 import ToastStack from '../components/ToastStack'
 import TypingOrb from '../components/TypingOrb'
+import ExpirySelector from '../components/ExpirySelector'
 import { socket } from '../lib/socket'
 import { getSavedUsername } from '../lib/storage'
 import { toDataUrl } from '../utils/format'
@@ -572,7 +573,7 @@ useEffect(() => {
 )}
 
       {/* ── Header ─────────────────────────────────────────────── */}
-      <header className="glass-panel flex shrink-0 items-center justify-between gap-4 rounded-2xl px-5 py-3">
+      <header className="glass-panel relative z-30 flex shrink-0 items-center justify-between gap-4 rounded-2xl px-5 py-3">
         {/* Left: room info */}
         <div className="flex items-center gap-3 min-w-0">
           <div
@@ -613,27 +614,13 @@ useEffect(() => {
 
           {creatorId === socket.id && (
             <div className="flex items-center gap-1.5">
-              <select
+              <ExpirySelector
                 value={roomExpiryMode}
-                onChange={e => {
-                  const val = Number(e.target.value);
-                  setRoomExpiryMode(val);
-                  socket.emit('room:set-expiry', { durationMs: val });
+                onChange={val => {
+                  setRoomExpiryMode(val)
+                  socket.emit('room:set-expiry', { durationMs: val })
                 }}
-                className="rounded-lg border px-2 py-1 text-[11px] outline-none"
-                style={{
-                  background: 'rgba(0,0,0,0.3)',
-                  borderColor: 'rgba(255,255,255,0.1)',
-                  color: '#94a3b8',
-                  cursor: 'pointer',
-                }}
-                title="Room Expiry"
-              >
-                <option value={0}>No Expiry</option>
-                <option value={5 * 60000}>5 Minutes</option>
-                <option value={30 * 60000}>30 Minutes</option>
-                <option value={60 * 60000}>1 Hour</option>
-              </select>
+              />
             </div>
           )}
 
